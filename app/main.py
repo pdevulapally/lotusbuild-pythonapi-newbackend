@@ -10,6 +10,7 @@ from app.api.routes import router
 from app.billing.routes import router as billing_router
 from app.github.routes import router as github_router
 from app.idempotency import IdempotencyConflict
+from app.execution.repository import CommandError
 from app.ratelimit import RateLimitMiddleware
 from app.security_log import log_security_event
 
@@ -67,6 +68,11 @@ app.include_router(github_router)
 @app.exception_handler(IdempotencyConflict)
 async def idempotency_conflict_handler(request: Request, exc: IdempotencyConflict):
     return JSONResponse({"detail": str(exc)}, status_code=409)
+
+
+@app.exception_handler(CommandError)
+async def command_error_handler(request: Request, exc: CommandError):
+    return JSONResponse({"detail": str(exc)}, status_code=exc.status)
 
 
 @app.exception_handler(Exception)

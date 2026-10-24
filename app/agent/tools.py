@@ -99,19 +99,9 @@ def _git_diff(session: dict, sandbox, input: dict) -> str:
 
 
 def _create_pull_request(session: dict, sandbox, input: dict) -> str:
-    # Deferred import: app.github depends on nothing in agent/, but keeping this
-    # import local avoids agent/tools.py (imported very early, by providers/base.py)
-    # pulling in the github package - and Firebase/crypto init - at module load time.
-    from app.github import client as github_client
-    from app.github import credentials as github_credentials
-
-    token = github_credentials.get_token(session["uid"])
-    push_cmd = f"git push https://x-access-token:$GH_TOKEN@github.com/{input['repo']}.git {input['head_branch']}"
-    push_output = _run_bash(sandbox, push_cmd, envs={"GH_TOKEN": token})
-    pr_url = github_client.create_pull_request(
-        token, input["repo"], input["title"], input["body"], input["head_branch"], input["base_branch"]
+    raise PermissionError(
+        "GitHub writes are disabled until a credential-isolated integration broker is implemented"
     )
-    return f"{push_output}\nopened pull request: {pr_url}"
 
 
 def _update_plan(session: dict, input: dict) -> str:
@@ -279,7 +269,7 @@ VIRTUAL_TOOL_SPECS: list[VirtualToolSpec] = [
 def supported_specs(sandbox) -> list[ToolSpec]:
     """Tool specs limited to what this live sandbox actually supports. Rendering
     these into a provider's wire format is that provider adapter's job."""
-    return [t for t in TOOL_SPECS if t.supported(sandbox)]
+    return [t for t in TOOL_SPECS if t.name != "create_pull_request" and t.supported(sandbox)]
 
 
 def run_tool(session: dict, sandbox, name: str, input: dict) -> object:

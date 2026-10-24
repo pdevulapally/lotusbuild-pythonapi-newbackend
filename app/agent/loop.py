@@ -1,4 +1,8 @@
 import time
+import uuid
+
+from app.execution.context import checkpoint
+from app.execution.repository import ExecutionStopped
 
 from app.agent.compaction import compact, needs_compaction
 from app.agent.memory import get_memory
@@ -183,12 +187,14 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
     one. Each iteration: compact if needed, call the model, save, dispatch any
     tool calls (pausing the whole batch if any of them is risky), save, trace.
     """
+    checkpoint()
     uid = session["uid"]
     sandbox = manager.get(session["id"])
     if sandbox is None:
         raise RuntimeError(f"no sandbox for session {session['id']}")
 
     for step in range(start_step, MAX_AGENT_STEPS):
+        checkpoint()
         step_started = time.monotonic()
 
         if needs_compaction(session["messages"]):
@@ -202,6 +208,7 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
             tools=tools,
             max_tokens=MAX_TOKENS,
         )
+        checkpoint()
         usage = adapter.usage(response)
         record_usage(uid, choice, usage)
         session["messages"].append(adapter.assistant_message(response))
@@ -227,6 +234,7 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
             # batch pauses, non-risky calls included (they auto-run on resume).
             session["status"] = "awaiting_approval"
             session["pending_approval"] = {
+                "id": uuid.uuid4().hex,
                 "provider": choice.provider,
                 "model": choice.model,
                 "quota": choice.quota,
@@ -247,8 +255,11 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
 
         results = []
         for call in calls:
+            checkpoint()
             try:
                 results.append((call.id, dispatch_tool_call(session, sandbox, call.name, call.input), False))
+            except ExecutionStopped:
+                raise
             except Exception as exc:
                 results.append((call.id, str(exc), True))
         session["messages"].extend(adapter.tool_result_messages(results))
@@ -279,6 +290,7 @@ def run_turn(session: dict, system_prompt: str | None = None) -> str:
     that silently drifts every time quota pushes a later turn to a different
     provider.
     """
+    checkpoint()
     uid = session["uid"]
     sandbox = manager.get(session["id"])
     if sandbox is None:
@@ -296,6 +308,7 @@ def resume_turn(session: dict, decisions: list[dict]) -> str:
     paused response - never re-runs pick_model, which could legally pick a
     different model than the one that already produced half this turn.
     """
+    checkpoint()
     pending = session["pending_approval"]
     adapter = get_adapter(pending["provider"])
     sandbox = manager.get(session["id"])
@@ -305,11 +318,14 @@ def resume_turn(session: dict, decisions: list[dict]) -> str:
     decided = {d["call_id"]: d["approved"] for d in decisions}
     results = []
     for call in pending["calls"]:
+        checkpoint()
         if call["risky"] and not decided.get(call["id"], False):
             results.append((call["id"], "user denied this action", True))
             continue
         try:
             results.append((call["id"], dispatch_tool_call(session, sandbox, call["name"], call["input"]), False))
+        except ExecutionStopped:
+            raise
         except Exception as exc:
             results.append((call["id"], str(exc), True))
 
@@ -319,52 +335,4 @@ def resume_turn(session: dict, decisions: list[dict]) -> str:
     save_session(session)
 
     choice = ModelEntry(pending["provider"], pending["model"], pending["quota"])
-    return _agent_loop(session, adapter, choice, _tools_for(adapter, sandbox), start_step=pending["steps_used"])
-
-
-def provision_and_run(session_id: str, kind: str) -> None:
-    """Background entry point for a newly created session - provisioning the
-    sandbox is itself a network call, so it moves off the request thread too."""
-    session = get_session(session_id)
-    if session is None:
-        log_security_event("background_task_failed", task="provision_and_run", session_id=session_id, error="session vanished before background task ran")
-        return
-    try:
-        manager.create(session_id, kind)
-        run_turn(session)  # system_prompt=None -> fresh dynamic build for this new session
-    except Exception as exc:
-        session["status"] = "error"
-        session["error"] = str(exc)
-        save_session(session)
-        log_security_event("background_task_failed", task="provision_and_run", session_id=session_id, error=str(exc))
-
-
-def run_turn_background(session_id: str) -> None:
-    session = get_session(session_id)
-    if session is None:
-        log_security_event("background_task_failed", task="run_turn", session_id=session_id, error="session vanished before background task ran")
-        return
-    try:
-        # Reuse the session's established prompt (set on its first turn) rather
-        # than rebuilding - keeps it stable for the session's lifetime even if a
-        # later turn's pick_model lands on a different provider than the first.
-        run_turn(session, system_prompt=session.get("system_prompt"))
-    except Exception as exc:
-        session["status"] = "error"
-        session["error"] = str(exc)
-        save_session(session)
-        log_security_event("background_task_failed", task="run_turn", session_id=session_id, error=str(exc))
-
-
-def resume_turn_background(session_id: str, decisions: list[dict]) -> None:
-    session = get_session(session_id)
-    if session is None:
-        log_security_event("background_task_failed", task="resume_turn", session_id=session_id, error="session vanished before background task ran")
-        return
-    try:
-        resume_turn(session, decisions)
-    except Exception as exc:
-        session["status"] = "error"
-        session["error"] = str(exc)
-        save_session(session)
-        log_security_event("background_task_failed", task="resume_turn", session_id=session_id, error=str(exc))
+    return _agent_loop(session, adapter, choice, _tools_for(adapter, sandbox), start_step=pending["steps_used"] + 1)

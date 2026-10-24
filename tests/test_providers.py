@@ -134,7 +134,7 @@ class _FakeLoopAdapter:
         return [{"role": "tool_result", "content": results}]
 
 
-def test_any_risky_call_pauses_the_whole_batch_and_dispatches_nothing():
+def test_any_risky_call_pauses_the_whole_batch_and_dispatches_nothing(monkeypatch):
     calls = [
         ToolCall("call_1", "read_file", {"path": "a.txt"}),
         ToolCall("call_2", "bash", {"command": "rm -rf /x"}),
@@ -142,12 +142,13 @@ def test_any_risky_call_pauses_the_whole_batch_and_dispatches_nothing():
     adapter = _FakeLoopAdapter(calls)
     dispatched = []
 
-    loop_module.manager.get = lambda session_id: object()
-    loop_module.save_session = lambda session: None
-    loop_module.record_usage = lambda uid, choice, usage: None
-    loop_module.needs_compaction = lambda messages: False
-    loop_module.record_step = lambda *a, **kw: None
-    loop_module.dispatch_tool_call = lambda session, sandbox, name, input: dispatched.append(name)
+    monkeypatch.setattr(loop_module.manager, "get", lambda session_id: object())
+    monkeypatch.setattr(loop_module, "checkpoint", lambda: None)
+    monkeypatch.setattr(loop_module, "save_session", lambda session: None)
+    monkeypatch.setattr(loop_module, "record_usage", lambda uid, choice, usage: None)
+    monkeypatch.setattr(loop_module, "needs_compaction", lambda messages: False)
+    monkeypatch.setattr(loop_module, "record_step", lambda *a, **kw: None)
+    monkeypatch.setattr(loop_module, "dispatch_tool_call", lambda session, sandbox, name, input: dispatched.append(name))
 
     session = {"id": "s1", "uid": "u1", "messages": [], "system_prompt": "sys", "status": "running"}
     choice = ModelEntry("anthropic", "claude-haiku-5-5", None)

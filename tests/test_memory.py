@@ -1,3 +1,5 @@
+import pytest
+
 import app.agent.memory as memory_module
 
 
@@ -51,8 +53,10 @@ class FakeDB:
         return FakeCollection(self._collections.setdefault(name, {}))
 
 
-memory_module.db = FakeDB()
-memory_module.firestore.ArrayUnion = FakeArrayUnion
+@pytest.fixture(autouse=True)
+def isolated_firestore(monkeypatch):
+    monkeypatch.setattr(memory_module, "db", FakeDB())
+    monkeypatch.setattr(memory_module.firestore, "ArrayUnion", FakeArrayUnion)
 
 
 def test_append_note_then_get_memory():

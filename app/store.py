@@ -3,17 +3,22 @@ import uuid
 
 from app.firebase import db
 
-SESSIONS_COLLECTION = "sessions"
+SESSIONS_COLLECTION = "agent_v2_sessions"
 
 
 def create_session(task: str, kind: str, uid: str) -> dict:
     """Pure builder - no I/O. Caller is responsible for save_session()."""
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     return {
         "id": uuid.uuid4().hex,
         "uid": uid,
         "kind": kind,
-        "status": "running",
+        "status": "queued",
+        "schema_version": 2,
+        "revision": 0,
+        "active_run_id": None,
+        "cancel_requested": False,
+        "recovery_required": False,
         "error": None,
         "messages": [{"role": "user", "content": [{"type": "text", "text": task}]}],
         "plan": None,
@@ -25,8 +30,8 @@ def create_session(task: str, kind: str, uid: str) -> dict:
 
 
 def save_session(session: dict) -> None:
-    session["updated_at"] = datetime.datetime.utcnow().isoformat()
-    db.collection(SESSIONS_COLLECTION).document(session["id"]).set(session)
+    from app.execution.context import save
+    save(session)
 
 
 def get_session(session_id: str) -> dict | None:
