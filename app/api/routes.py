@@ -1,14 +1,14 @@
 import asyncio
 import os
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
-from app.agent.loop import provision_and_run, resume_turn_background, run_turn_background
 from app.agent.memory import clear_memory, get_memory
 from app.agent.tracing import get_trace
 from app.auth import get_uid
-from app.idempotency import require_idempotency_key, run_idempotent
+from app.idempotency import require_idempotency_key
+from app.execution.repository import runs
 from app.models import (
     ApproveIn,
     DesktopOut,
@@ -20,12 +20,12 @@ from app.models import (
 )
 from app.ratelimit import rate_limit_dependency
 from app.sandbox.manager import manager
-from app.store import create_session, get_session, save_session
+from app.store import get_session
 
 router = APIRouter()
 
 SSE_POLL_INTERVAL_SECONDS = float(os.environ.get("SSE_POLL_INTERVAL_SECONDS", "1"))
-_TERMINAL_STATUSES = {"idle", "error"}
+_TERMINAL_STATUSES = {"idle", "error", "cancelled", "awaiting_approval"}
 
 
 def _require_session(session_id: str, uid: str) -> dict:
@@ -35,21 +35,21 @@ def _require_session(session_id: str, uid: str) -> dict:
     return session
 
 
+def _require_live_session(session_id: str, uid: str) -> dict:
+    session = _require_session(session_id, uid)
+    if session.get("cancel_requested") or session.get("recovery_required"):
+        raise HTTPException(status_code=409, detail="sandbox access disabled for a stopped run")
+    return session
+
+
 @router.post("/sessions", response_model=SessionOut)
 def start_session(
     body: SessionCreate,
-    background_tasks: BackgroundTasks,
     uid: str = Depends(get_uid),
     idempotency_key: str = Depends(require_idempotency_key),
     _rl: None = Depends(rate_limit_dependency("mutate")),
 ):
-    def do():
-        session = create_session(body.task, body.kind, uid)
-        save_session(session)
-        background_tasks.add_task(provision_and_run, session["id"], body.kind)
-        return 200, session
-
-    return run_idempotent(uid, "sessions:create", idempotency_key, do).body
+    return runs.submit(uid, idempotency_key, "create", body.model_dump())
 
 
 @router.get("/sessions/{session_id}", response_model=SessionOut)
@@ -74,7 +74,7 @@ async def stream_session(session_id: str, uid: str = Depends(get_uid)):
         while True:
             session = await asyncio.to_thread(get_session, session_id)
             if session is None or session["uid"] != uid:
-                yield "event: error\ndata: session not found\n\n"
+                yield 'event: error\ndata: {"error":"session not found"}\n\n'
                 return
             marker = (session["updated_at"], len(session["messages"]))
             if marker != last_seen:
@@ -91,57 +91,32 @@ async def stream_session(session_id: str, uid: str = Depends(get_uid)):
 def send_message(
     session_id: str,
     body: MessageIn,
-    background_tasks: BackgroundTasks,
     uid: str = Depends(get_uid),
     idempotency_key: str = Depends(require_idempotency_key),
     _rl: None = Depends(rate_limit_dependency("mutate")),
 ):
-    def do():
-        session = _require_session(session_id, uid)
-        if session["status"] in ("running", "awaiting_approval"):
-            raise HTTPException(status_code=409, detail=f"session is {session['status']}")
-        session["messages"].append({"role": "user", "content": [{"type": "text", "text": body.content}]})
-        session["status"] = "running"
-        save_session(session)
-        background_tasks.add_task(run_turn_background, session_id)
-        return 200, session
-
-    return run_idempotent(uid, f"sessions:message:{session_id}", idempotency_key, do).body
+    return runs.submit(uid, idempotency_key, "message", body.model_dump(), session_id)
 
 
 @router.post("/sessions/{session_id}/approve", response_model=SessionOut)
 def approve(
     session_id: str,
     body: ApproveIn,
-    background_tasks: BackgroundTasks,
     uid: str = Depends(get_uid),
     idempotency_key: str = Depends(require_idempotency_key),
     _rl: None = Depends(rate_limit_dependency("mutate")),
 ):
-    def do():
-        session = _require_session(session_id, uid)
-        if session["status"] != "awaiting_approval":
-            raise HTTPException(status_code=409, detail="no pending approval on this session")
-        risky_ids = {c["id"] for c in session["pending_approval"]["calls"] if c["risky"]}
-        decided_ids = {d.call_id for d in body.decisions}
-        if not risky_ids <= decided_ids:
-            raise HTTPException(status_code=400, detail="must decide on every risky pending call")
-        background_tasks.add_task(resume_turn_background, session_id, [d.model_dump() for d in body.decisions])
-        return 200, session
-
-    return run_idempotent(uid, f"sessions:approve:{session_id}", idempotency_key, do).body
+    return runs.submit(uid, idempotency_key, "approve", body.model_dump(), session_id)
 
 
-@router.delete("/sessions/{session_id}")
+@router.delete("/sessions/{session_id}", response_model=SessionOut)
 def end_session(session_id: str, uid: str = Depends(get_uid)):
-    _require_session(session_id, uid)
-    manager.close(session_id)
-    return {"status": "closed"}
+    return runs.cancel(session_id, uid)
 
 
 @router.get("/sessions/{session_id}/preview", response_model=PreviewOut)
 def preview(session_id: str, port: int, uid: str = Depends(get_uid)):
-    _require_session(session_id, uid)
+    _require_live_session(session_id, uid)
     try:
         return {"url": manager.preview_url(session_id, port)}
     except ValueError as exc:
@@ -150,7 +125,7 @@ def preview(session_id: str, port: int, uid: str = Depends(get_uid)):
 
 @router.get("/sessions/{session_id}/desktop", response_model=DesktopOut)
 def desktop(session_id: str, uid: str = Depends(get_uid)):
-    _require_session(session_id, uid)
+    _require_live_session(session_id, uid)
     try:
         return {"stream_url": manager.desktop_stream_url(session_id)}
     except ValueError as exc:
@@ -159,7 +134,7 @@ def desktop(session_id: str, uid: str = Depends(get_uid)):
 
 @router.get("/sessions/{session_id}/screenshot")
 def screenshot(session_id: str, uid: str = Depends(get_uid)):
-    _require_session(session_id, uid)
+    _require_live_session(session_id, uid)
     try:
         png = manager.screenshot(session_id)
     except ValueError as exc:

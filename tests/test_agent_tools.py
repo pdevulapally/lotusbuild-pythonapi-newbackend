@@ -59,7 +59,7 @@ class FakeDesktopSandbox(FakeCodeSandbox):
 def test_code_sandbox_exposes_only_core_tools():
     names = {t.name for t in supported_specs(FakeCodeSandbox())}
     assert names == {
-        "bash", "read_file", "write_file", "expose_port", "git_commit", "git_diff", "create_pull_request",
+        "bash", "read_file", "write_file", "expose_port", "git_commit", "git_diff",
     }
 
 
@@ -106,3 +106,9 @@ if __name__ == "__main__":
     test_run_tool_rejects_unknown_tool()
     test_manager_rejects_unknown_sandbox_kind()
     print("ok")
+
+
+def test_github_write_fails_closed_without_accessing_credentials():
+    import pytest
+    with pytest.raises(PermissionError, match="disabled"):
+        run_tool({}, None, "create_pull_request", {})

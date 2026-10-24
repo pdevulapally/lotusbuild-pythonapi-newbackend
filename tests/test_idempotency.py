@@ -1,4 +1,5 @@
 import datetime
+import pytest
 
 import app.idempotency as idempotency_module
 from app.idempotency import IdempotencyConflict, run_idempotent
@@ -53,8 +54,10 @@ class FakeDB:
 # decorator drives retries against a live Firestore Transaction's begin/commit,
 # which this offline test has no need to exercise; the state-machine logic in
 # run_idempotent (missing/completed/fresh/stale/exception) is what's under test.
-idempotency_module.db = FakeDB()
-idempotency_module.firestore.transactional = lambda fn: fn
+@pytest.fixture(autouse=True)
+def isolated_firestore(monkeypatch):
+    monkeypatch.setattr(idempotency_module, "db", FakeDB())
+    monkeypatch.setattr(idempotency_module.firestore, "transactional", lambda fn: fn)
 
 
 def test_first_call_runs_fn_and_caches():

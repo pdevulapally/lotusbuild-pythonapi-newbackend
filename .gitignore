@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .env
 workspace/
+
+.venv/
+.pytest_cache/

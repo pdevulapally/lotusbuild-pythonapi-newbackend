@@ -1,3 +1,5 @@
+import pytest
+
 import app.agent.tracing as tracing_module
 from app.agent.tracing import get_trace, record_step
 
@@ -46,11 +48,13 @@ class FakeDB:
         self._stores: dict[str, dict] = {}
 
     def collection(self, name):
-        assert name == "sessions"
+        assert name == "agent_v2_sessions"
         return FakeCollection(self._stores)
 
 
-tracing_module.db = FakeDB()
+@pytest.fixture(autouse=True)
+def isolated_firestore(monkeypatch):
+    monkeypatch.setattr(tracing_module, "db", FakeDB())
 
 
 def test_record_and_get_trace_ordered_by_step():
@@ -63,8 +67,8 @@ def test_record_and_get_trace_ordered_by_step():
         provider="anthropic", model="claude-haiku-5-5",
     )
     trace = get_trace("s1")
-    assert [t["step"] for t in trace] == [0, 1]
-    assert trace[1]["tool"] == ["bash"]
+    assert [t["step"] for t in trace] == [1, 0]
+    assert trace[0]["tool"] == ["bash"]
 
 
 if __name__ == "__main__":

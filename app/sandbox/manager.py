@@ -9,7 +9,7 @@ from app.firebase import db
 # that varies per deployment (template, timeout) comes from env vars keyed by
 # kind, not from code - add a new kind by setting E2B_<KIND>_TEMPLATE, no edits below.
 _BACKENDS = {"code": CodeSandbox, "desktop": DesktopSandbox}
-REGISTRY_COLLECTION = "sandbox_registry"
+REGISTRY_COLLECTION = "agent_v2_sandbox_registry"
 
 
 def _kind_config(kind: str) -> dict:
@@ -54,10 +54,9 @@ class SandboxManager:
             ) from exc
 
     def close(self, session_id: str) -> None:
-        try:
-            sandbox = self.get(session_id)
-        except ValueError:
-            sandbox = None
+        # Connection failure does not prove termination. Retain the registry
+        # so durable cleanup can retry/reconcile rather than orphan a resource.
+        sandbox = self.get(session_id)
         if sandbox is not None:
             sandbox.kill()
         db.collection(REGISTRY_COLLECTION).document(session_id).delete()
