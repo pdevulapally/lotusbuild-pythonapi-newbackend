@@ -1,0 +1,12 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Deny-all default. The backend talks to Firestore exclusively through the
+    // Admin SDK, which bypasses these rules entirely - this is a safety net
+    // against a future stray client-SDK integration, not something the
+    // backend's own behavior depends on.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
