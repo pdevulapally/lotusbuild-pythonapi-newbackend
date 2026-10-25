@@ -1,5 +1,11 @@
 # Durable execution foundation (review branch)
 
+Subsequent local supervision is documented in `PROCESS_SUPERVISION.md`: the
+guarded worker now spawns owned execution/cleanup processes, stages terminal
+results until clean exit, and retains uncertain state without replay. Historical
+cooperative-thread limitations below describe the foundation checkpoint. Linux
+descendant containment, live SDK termination and remote reconciliation remain open.
+
 This is an isolated development foundation, not a production-ready agent platform.
 No production data migration or VPS changes are included.
 
@@ -99,3 +105,11 @@ Use a separate project until a complete migration is designed.
   readiness checks, backups and rollback rehearsal.
 
 Do not label this implementation exactly-once execution or fully secure.
+
+
+Later local slices supersede the earlier partial-foundation list above:
+`EXECUTION_BUDGETS.md`, `SESSION_EVENTS_CONTRACT.md`, `EXECUTION_SAFETY.md`,
+`PROCESS_SUPERVISION.md` and `ACTION_RECEIPTS.md` describe the implemented
+authorities and verification. Action receipts and unverified evidence now exist;
+trusted remote resolution, external exactly-once behavior and workspace restore
+remain unfinished. Keep the worker guarded and integrations isolated.

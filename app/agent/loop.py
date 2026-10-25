@@ -1,8 +1,9 @@
 import time
-import uuid
 
-from app.execution.context import checkpoint
+from app.execution.context import checkpoint, prepare_actions
 from app.execution.repository import ExecutionStopped
+from app.execution.errors import OutputLimitExceeded
+from app.execution.limits import bounded_json, MAX_TOOL_OUTPUT_BYTES
 
 from app.agent.compaction import compact, needs_compaction
 from app.agent.memory import get_memory
@@ -10,14 +11,24 @@ from app.agent.providers import get_adapter
 from app.agent.risk import RISK_POLICY, is_risky
 from app.agent.tools import VIRTUAL_TOOL_SPECS, dispatch_tool_call, supported_specs
 from app.agent.tracing import record_step
-from app.billing.entitlements import resolve_entitlements
-from app.billing.model_select import pick_model
+from app.billing import entitlements as entitlement_service
+from app.billing.model_select import pick_model, selected_model, validate_selection, require_model_kind
 from app.billing.plans import ModelEntry
-from app.billing.usage import record_usage
+from app.billing.budgets import metered_create, MAX_OUTPUT_TOKENS
 from app.config import MAX_AGENT_STEPS, MAX_TOKENS
 from app.sandbox.manager import manager
 from app.security_log import log_security_event
 from app.store import get_session, save_session
+
+
+def _validate_tool_batch(calls):
+    from app.execution.actions import validate_batch
+    validate_batch(calls)
+
+
+def _append_result(results, result):
+    results.append(result)
+    bounded_json(results, MAX_TOOL_OUTPUT_BYTES)
 
 _IDENTITY = (
     "# Identity and mission\n\n"
@@ -154,8 +165,6 @@ def _build_system_prompt(sandbox, adapter, uid: str) -> str:
             "Your sandbox is a headless Linux environment - shell and file "
             "tools only, no GUI."
         )
-    if adapter.supports_web_search:
-        environment += " You also have a web_search tool for anything that needs current information."
 
     parts = [
         _IDENTITY,
@@ -176,10 +185,11 @@ def _build_system_prompt(sandbox, adapter, uid: str) -> str:
     return "\n\n".join(parts)
 
 
-def _tools_for(adapter, sandbox) -> list[dict]:
-    return adapter.tool_schemas(
-        supported_specs(sandbox) + VIRTUAL_TOOL_SPECS, include_web_search=adapter.supports_web_search
-    )
+def _tools_for(adapter, sandbox, session=None) -> list[dict]:
+    from app.agent.policy import session_mode, tool_allowed
+    mode = session_mode(session or {})
+    specs = supported_specs(sandbox) + VIRTUAL_TOOL_SPECS
+    return adapter.tool_schemas([s for s in specs if tool_allowed(s, mode) and (not session.get("task_authorization_id") or s.name in session.get("task_allowed_tools", []))], include_web_search=False)
 
 
 def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], start_step: int = 0) -> str:
@@ -188,6 +198,7 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
     tool calls (pausing the whole batch if any of them is risky), save, trace.
     """
     checkpoint()
+    validate_selection(session)
     uid = session["uid"]
     sandbox = manager.get(session["id"])
     if sandbox is None:
@@ -198,20 +209,21 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
         step_started = time.monotonic()
 
         if needs_compaction(session["messages"]):
-            compact(session)
+            compact(session, choice)
             save_session(session)
 
-        response = adapter.create(
-            model=choice.model,
-            system=session["system_prompt"],
+        response = metered_create(uid, adapter, choice,
+            system=session["system_prompt"] + ("\n\nPlan mode: inspect files and explain the approach. Only read capabilities are granted."
+                                               if session.get("mode") == "plan" else ""),
             messages=session["messages"],
             tools=tools,
-            max_tokens=MAX_TOKENS,
+            max_tokens=min(MAX_TOKENS, MAX_OUTPUT_TOKENS),
         )
         checkpoint()
         usage = adapter.usage(response)
-        record_usage(uid, choice, usage)
-        session["messages"].append(adapter.assistant_message(response))
+        assistant = adapter.assistant_message(response)
+        session["messages"].append(assistant)
+        session["_transcript_append"] = [assistant]
         save_session(session)
 
         if not adapter.is_tool_use(response):
@@ -225,6 +237,7 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
             return adapter.text(response)
 
         calls = adapter.tool_calls(response)
+        batch = prepare_actions(session, step, [{"id": c.id, "name": c.name, "input": c.input} for c in calls])
         risky = [c for c in calls if is_risky(c.name, c.input)]
 
         if risky:
@@ -234,14 +247,16 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
             # batch pauses, non-risky calls included (they auto-run on resume).
             session["status"] = "awaiting_approval"
             session["pending_approval"] = {
-                "id": uuid.uuid4().hex,
+                "id": batch["batch_id"],
+                "batch_id": batch["batch_id"],
                 "provider": choice.provider,
                 "model": choice.model,
                 "quota": choice.quota,
                 "steps_used": step,
                 "calls": [
-                    {"id": c.id, "name": c.name, "input": c.input, "risky": is_risky(c.name, c.input)}
-                    for c in calls
+                    {"id": c.id, "name": c.name, "input": c.input, "risky": is_risky(c.name, c.input),
+                     "action_id": action_id}
+                    for c, action_id in zip(calls, batch["action_ids"])
                 ],
             }
             save_session(session)
@@ -254,14 +269,14 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
             return "awaiting approval for a pending action"
 
         results = []
-        for call in calls:
+        for call, action_id in zip(calls, batch["action_ids"]):
             checkpoint()
             try:
-                results.append((call.id, dispatch_tool_call(session, sandbox, call.name, call.input), False))
+                _append_result(results, (call.id, dispatch_tool_call(session, sandbox, call.name, call.input, action_id), False))
             except ExecutionStopped:
                 raise
-            except Exception as exc:
-                results.append((call.id, str(exc), True))
+            except Exception:
+                _append_result(results, (call.id, "tool could not be completed", True))
         session["messages"].extend(adapter.tool_result_messages(results))
         save_session(session)
         record_step(
@@ -277,18 +292,12 @@ def _agent_loop(session: dict, adapter, choice: ModelEntry, tools: list[dict], s
 
 
 def run_turn(session: dict, system_prompt: str | None = None) -> str:
-    """Resolve provider/model ONCE for this call (not per tool-use iteration) -
-    still required even though session["messages"] is canonical, so a single
-    turn's tool loop stays on one vendor's render() without re-querying quota
-    mid-loop. A LATER call to run_turn/resume_turn can safely land on a
-    different provider - that's the whole point of pick_model's fallback.
+    """Use the persisted explicit model without fallback. Historical unset
+    selections retain native fallback between turns. Resolve once per turn;
+    every spend still rechecks current entitlement and atomic quota.
 
-    `system_prompt=None` (the default, used for a brand-new session) builds a
-    fresh dynamic prompt from the sandbox/adapter/user now resolved. Passing an
-    existing one (an ongoing session's later message) reuses it verbatim - the
-    whole point is one stable prompt for the session's lifetime, not a prompt
-    that silently drifts every time quota pushes a later turn to a different
-    provider.
+    A new session builds its prompt from current sandbox/provider capabilities.
+    Later turns reuse that prompt and append current Plan guidance per call.
     """
     checkpoint()
     uid = session["uid"]
@@ -296,11 +305,12 @@ def run_turn(session: dict, system_prompt: str | None = None) -> str:
     if sandbox is None:
         raise RuntimeError(f"no sandbox for session {session['id']}")
 
-    entitlements = resolve_entitlements(uid)
-    choice = pick_model(entitlements, uid, sandbox)
+    entitlements = entitlement_service.resolve_entitlements(uid)
+    choice = selected_model(session, entitlements) or pick_model(entitlements, uid, sandbox)
+    require_model_kind(choice, session["kind"])
     adapter = get_adapter(choice.provider)
     session["system_prompt"] = system_prompt or _build_system_prompt(sandbox, adapter, uid)
-    return _agent_loop(session, adapter, choice, _tools_for(adapter, sandbox))
+    return _agent_loop(session, adapter, choice, _tools_for(adapter, sandbox, session))
 
 
 def resume_turn(session: dict, decisions: list[dict]) -> str:
@@ -310,7 +320,9 @@ def resume_turn(session: dict, decisions: list[dict]) -> str:
     """
     checkpoint()
     pending = session["pending_approval"]
-    adapter = get_adapter(pending["provider"])
+    _validate_tool_batch([{"id": c["id"], "name": c["name"], "input": c["input"]} for c in pending["calls"]])
+    choice = selected_model(session, entitlement_service.resolve_entitlements(session["uid"]), pending)
+    adapter = get_adapter(choice.provider)
     sandbox = manager.get(session["id"])
     if sandbox is None:
         raise RuntimeError(f"no sandbox for session {session['id']}")
@@ -320,19 +332,18 @@ def resume_turn(session: dict, decisions: list[dict]) -> str:
     for call in pending["calls"]:
         checkpoint()
         if call["risky"] and not decided.get(call["id"], False):
-            results.append((call["id"], "user denied this action", True))
+            _append_result(results, (call["id"], "user denied this action", True))
             continue
         try:
-            results.append((call["id"], dispatch_tool_call(session, sandbox, call["name"], call["input"]), False))
+            _append_result(results, (call["id"], dispatch_tool_call(session, sandbox, call["name"], call["input"], call["action_id"]), False))
         except ExecutionStopped:
             raise
-        except Exception as exc:
-            results.append((call["id"], str(exc), True))
+        except Exception:
+            _append_result(results, (call["id"], "tool could not be completed", True))
 
     session["messages"].extend(adapter.tool_result_messages(results))
     session["status"] = "running"
     session["pending_approval"] = None
     save_session(session)
 
-    choice = ModelEntry(pending["provider"], pending["model"], pending["quota"])
-    return _agent_loop(session, adapter, choice, _tools_for(adapter, sandbox), start_step=pending["steps_used"] + 1)
+    return _agent_loop(session, adapter, choice, _tools_for(adapter, sandbox, session), start_step=pending["steps_used"] + 1)

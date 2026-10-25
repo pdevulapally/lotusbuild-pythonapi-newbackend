@@ -4,6 +4,10 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from e2b.sandbox.commands.command_handle import CommandExitException
+from jsonschema import Draft202012Validator, ValidationError
+from app.execution.errors import ExecutionStopped, SafetyStop, ToolOutcomeUncertain, OutputLimitExceeded
+from app.execution.limits import bounded_json, MAX_TOOL_INPUT_BYTES, MAX_TOOL_OUTPUT_BYTES
+from app.github.operations import PROPOSAL_SCHEMA
 
 
 @dataclass
@@ -16,6 +20,9 @@ class ToolSpec:
     # attribute the handler needs - not by a hand-maintained per-kind list that
     # can drift out of sync with what the sandbox object actually supports.
     supported: Callable[[object], bool] = field(default=lambda sandbox: True)
+    effectful: bool = True
+    enabled: bool = True
+    plan_capability: str | None = None
 
 
 @dataclass
@@ -27,6 +34,8 @@ class VirtualToolSpec:
     description: str
     schema: dict
     handler: Callable[[dict, dict], object]
+    effectful: bool = True
+    plan_capability: str | None = None
 
 
 def _needs(attr: str) -> Callable[[object], bool]:
@@ -38,7 +47,9 @@ def _run_bash(sandbox, command: str, envs: dict | None = None) -> str:
         result = sandbox.commands.run(command, envs=envs)
     except CommandExitException as exc:
         result = exc
-    output = (result.stdout or "") + (result.stderr or "")
+    stdout, stderr = result.stdout or "", result.stderr or ""
+    bounded_json([stdout, stderr], MAX_TOOL_OUTPUT_BYTES)
+    output = stdout + stderr
     return output or f"(exit {result.exit_code}, no output)"
 
 
@@ -61,6 +72,8 @@ def _expose_port(session: dict, sandbox, input: dict) -> str:
 
 def _screenshot(session: dict, sandbox, input: dict) -> list[dict]:
     png = sandbox.screenshot()
+    if not isinstance(png, bytes) or len(png) > MAX_TOOL_OUTPUT_BYTES:
+        raise OutputLimitExceeded("screenshot")
     data = base64.b64encode(png).decode()
     return [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}]
 
@@ -100,7 +113,7 @@ def _git_diff(session: dict, sandbox, input: dict) -> str:
 
 def _create_pull_request(session: dict, sandbox, input: dict) -> str:
     raise PermissionError(
-        "GitHub writes are disabled until a credential-isolated integration broker is implemented"
+        "GitHub writes are disabled pending verified production broker configuration"
     )
 
 
@@ -128,6 +141,8 @@ TOOL_SPECS: list[ToolSpec] = [
         "Read a text file from the sandbox.",
         {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
         _read_file,
+        effectful=False,
+        plan_capability="read_file",
     ),
     ToolSpec(
         "write_file",
@@ -151,6 +166,7 @@ TOOL_SPECS: list[ToolSpec] = [
         {"type": "object", "properties": {}},
         _screenshot,
         supported=_needs("screenshot"),
+        effectful=False,
     ),
     ToolSpec(
         "click",
@@ -216,21 +232,11 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         "create_pull_request",
-        "Push the current branch to GitHub (assumes it already exists locally, e.g. via "
-        "`git checkout -b`) and open a pull request. Requires the user to have linked their "
-        "GitHub account.",
-        {
-            "type": "object",
-            "properties": {
-                "repo": {"type": "string", "description": "owner/name"},
-                "title": {"type": "string"},
-                "body": {"type": "string"},
-                "head_branch": {"type": "string"},
-                "base_branch": {"type": "string"},
-            },
-            "required": ["repo", "title", "head_branch", "base_branch"],
-        },
+        "Propose a pull request between mutable named branches in the same repository. "
+        "Requires a trusted installation broker and consequential-write approval. Does not push files.",
+        PROPOSAL_SCHEMA,
         _create_pull_request,
+        enabled=False,
     ),
 ]
 
@@ -256,6 +262,7 @@ VIRTUAL_TOOL_SPECS: list[VirtualToolSpec] = [
             "required": ["steps"],
         },
         _update_plan,
+        effectful=False,
     ),
     VirtualToolSpec(
         "remember",
@@ -269,23 +276,70 @@ VIRTUAL_TOOL_SPECS: list[VirtualToolSpec] = [
 def supported_specs(sandbox) -> list[ToolSpec]:
     """Tool specs limited to what this live sandbox actually supports. Rendering
     these into a provider's wire format is that provider adapter's job."""
-    return [t for t in TOOL_SPECS if t.name != "create_pull_request" and t.supported(sandbox)]
+    return [t for t in TOOL_SPECS if t.enabled and t.supported(sandbox)]
 
 
-def run_tool(session: dict, sandbox, name: str, input: dict) -> object:
+def tool_spec(name):
+    for spec in VIRTUAL_TOOL_SPECS + TOOL_SPECS:
+        if spec.name == name:
+            if not getattr(spec, "enabled", True):
+                raise PermissionError("tool execution is disabled")
+            return spec
+    raise ValueError("unknown tool")
+
+
+def validate_tool_input(spec, input):
+    bounded_json(input, MAX_TOOL_INPUT_BYTES, tool=spec.name)
+    try:
+        Draft202012Validator(spec.schema).validate(input)
+    except ValidationError:
+        # This is a known rejection BEFORE handler dispatch. The schema error
+        # may contain submitted content; do not send it to models or logs.
+        raise ValueError("invalid tool arguments") from None
+
+
+def _invoke(spec, args, input, action_id=None):
+    from app.agent.policy import require_tool
+    require_tool(args[0], spec)
+    validate_tool_input(spec, input)
+    from app.execution.context import action
+    action("permit_action", action_id=action_id, name=spec.name, input=input)
+    try:
+        result = spec.handler(*args)
+    except SafetyStop as exc:
+        exc.recovery.setdefault("tool", spec.name)
+        raise
+    except ExecutionStopped:
+        raise
+    except Exception:
+        if spec.effectful:
+            raise ToolOutcomeUncertain(spec.name) from None
+        from app.execution.errors import LeaseLost
+        raise LeaseLost("observation handler did not return") from None
+    bounded_json(result, MAX_TOOL_OUTPUT_BYTES, tool=spec.name)
+    # Store only a digest; returning from a handler is not proof of a
+    # provider's intended effect. Invalid/oversized results stay unknown.
+    from app.execution.repository import _digest
+    action("record_action_result", action_id=action_id, result_digest=_digest(result))
+    return result
+
+
+def run_tool(session: dict, sandbox, name: str, input: dict, action_id=None) -> object:
     for t in TOOL_SPECS:
         if t.name == name:
+            if not t.enabled:
+                raise PermissionError("tool execution is disabled")
             if not t.supported(sandbox):
                 raise ValueError(f"tool {name!r} is not supported by this sandbox")
-            return t.handler(session, sandbox, input)
-    raise ValueError(f"unknown tool: {name}")
+            return _invoke(t, (session, sandbox, input), input, action_id)
+    raise ValueError("unknown tool")
 
 
-def dispatch_tool_call(session: dict, sandbox, name: str, input: dict) -> object:
+def dispatch_tool_call(session: dict, sandbox, name: str, input: dict, action_id=None) -> object:
     """The one call site for executing any tool call - checks virtual tools (which
     mutate session state directly and never touch the sandbox) first, then falls
     through to the sandbox-dispatched tools in TOOL_SPECS."""
     for t in VIRTUAL_TOOL_SPECS:
         if t.name == name:
-            return t.handler(session, input)
-    return run_tool(session, sandbox, name, input)
+            return _invoke(t, (session, input), input, action_id)
+    return run_tool(session, sandbox, name, input, action_id)

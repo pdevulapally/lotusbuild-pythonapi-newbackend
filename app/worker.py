@@ -9,8 +9,9 @@ import signal
 import threading
 import uuid
 
-from app.execution.context import Guard, execution_context
 from app.execution.repository import CancelRequested, ExecutionStopped, LeaseLost, runs
+from app.execution.errors import SafetyStop
+from app.execution.supervision import ProcessStopped, supervise, supervise_cleanup
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,11 @@ def execute(job, session):
 
     checkpoint()
     if job["operation"] == "create":
+        from app.billing.model_select import selected_model, require_model_kind, validate_selection
+        from app.billing.entitlements import resolve_entitlements
+        validate_selection(session)
+        if session.get("model") is not None:
+            require_model_kind(selected_model(session, resolve_entitlements(session["uid"])), session["kind"])
         manager.create(session["id"], session["kind"])
         checkpoint()
         run_turn(session)
@@ -34,61 +40,58 @@ def execute(job, session):
         raise ValueError("unsupported job operation")
 
 
-def process_claim(repository, claim, handler=execute, heartbeat_interval=10, cleanup_handler=None):
-    guard = Guard(repository, claim)
-    stopped = threading.Event()
-
-    def heartbeat():
-        while not stopped.wait(heartbeat_interval):
-            try:
-                repository.heartbeat(claim)
-            except Exception:
-                # Fail closed on outages. An in-flight remote effect may finish,
-                # but this worker must not start further effects or save state.
-                guard.lost = True
-                if cleanup_handler is not None:
-                    try:
-                        repository.cleanup_once(cleanup_handler, claim.owner)
-                    except Exception:
-                        pass  # Intent remains durable for another poller.
-                return
-
-    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
-    heartbeat_thread.start()
+def process_claim(repository, claim, handler=execute, heartbeat_interval=10,
+                  *, stopping=None, execution=supervise, on_started=None):
     try:
-        job, session = repository.start(claim)
-        with execution_context(guard):
-            handler(job, session)
-            guard.checkpoint()
-        repository.finish(claim)
+        execution(repository, claim, handler, heartbeat_interval=heartbeat_interval,
+                  stopping=stopping, on_started=on_started)
     except CancelRequested:
         try:
             repository.finish(claim)
         except LeaseLost:
             pass
     except LeaseLost:
-        # Another worker/recovery owns state now. Never write an error over it.
-        pass
-    except Exception:
-        logger.error("run execution failed", extra={"job_id": claim.job_id})
+        # A rejected child result can leave our own job active. Recheck through
+        # the same authoritative finish; a changed/expired fence still rejects.
         try:
-            repository.finish(claim, failed=True)
+            repository.finish(claim, failed=True, recovery=ProcessStopped("authority_lost").recovery)
         except ExecutionStopped:
             pass
-    finally:
-        stopped.set()
-        heartbeat_thread.join(timeout=heartbeat_interval + 1)
+    except Exception as exc:
+        logger.error("run execution failed", extra={"job_id": claim.job_id})
+        try:
+            repository.finish(claim, failed=True, recovery=exc.recovery if isinstance(exc, SafetyStop) else None)
+        except ExecutionStopped:
+            pass
 
 
-def run_once(repository=runs, owner=None, handler=execute):
+def run_once(repository=runs, owner=None, handler=execute, *, stopping=None, queue_authorizer=None):
     owner = owner or uuid.uuid4().hex
-    from app.sandbox.manager import manager
-    repository.cleanup_once(manager.close, owner)
+    if stopping is not None and stopping.is_set():
+        return False
+    repository.cleanup_once(lambda sid: supervise_cleanup(sid, stopping=stopping), owner)
     for job_id in repository.candidates():
+        if stopping is not None and stopping.is_set():
+            return False
         claim = repository.claim(job_id, owner)
         if claim:
-            process_claim(repository, claim, handler, cleanup_handler=manager.close)
+            process_claim(repository, claim, handler, stopping=stopping)
             return True
+    # No stored bearer or assumed background auth. Automatic promotion is
+    # explicitly closed until a trusted fresh subject-status reader is supplied.
+    if queue_authorizer is not None:
+        for candidate in repository.queue_candidates():
+            if stopping is not None and stopping.is_set():
+                return False
+            try:
+                authorization = queue_authorizer(candidate)
+                repository.dispatch_next(candidate["session_id"], candidate["uid"],
+                                         "worker:" + candidate["id"], authorization)
+                return True
+            except Exception as exc:
+                # One blocked account must not starve the bounded batch. No
+                # effect executed here; pending intent and counters are retained.
+                logger.warning("queued turn was not admitted", extra={"error_type": type(exc).__name__})
     return False
 
 
@@ -104,7 +107,7 @@ def main():
     owner = uuid.uuid4().hex
     while not stopping.is_set():
         try:
-            if not run_once(owner=owner):
+            if not run_once(owner=owner, stopping=stopping):
                 stopping.wait(1)
         except Exception:
             logger.error("durable worker polling failed")

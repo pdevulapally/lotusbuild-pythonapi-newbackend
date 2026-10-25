@@ -14,8 +14,9 @@ class ModelEntry:
     quota: dict | None  # {"requests_per_day": int, "tokens_per_month": int} or None = unlimited
 
 
-def get_plan(tier_id: str) -> dict:
-    doc = db.collection(PLANS_COLLECTION).document(tier_id).get()
+def get_plan(tier_id: str, *, client=None, transaction=None) -> dict:
+    ref = (db if client is None else client).collection(PLANS_COLLECTION).document(tier_id)
+    doc = ref.get() if transaction is None else ref.get(transaction=transaction)
     if not doc.exists:
         raise ValueError(f"no plan configured for tier {tier_id!r}")
     return doc.to_dict()

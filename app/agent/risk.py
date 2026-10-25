@@ -29,6 +29,8 @@ RISK_POLICY: dict[str, str | list[str]] = {
 
 
 def is_risky(name: str, input: dict) -> bool:
+    if name == "create_pull_request":
+        return True
     policy = RISK_POLICY.get(name)
     if policy is None:
         return False

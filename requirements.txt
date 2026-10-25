@@ -9,3 +9,4 @@ firebase-admin>=6.5
 stripe>=11.0
 redis>=5.0
 cryptography>=42.0
+jsonschema>=4.23,<5

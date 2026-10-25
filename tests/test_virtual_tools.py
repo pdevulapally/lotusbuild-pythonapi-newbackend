@@ -1,3 +1,4 @@
+from tool_unit_adapter import handler_receipt_adapter
 import app.agent.memory as memory_module
 from app.agent.tools import dispatch_tool_call
 

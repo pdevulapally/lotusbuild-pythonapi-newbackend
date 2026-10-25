@@ -1,0 +1,113 @@
+name: Backend checks and blocked release preparation
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  checks:
+    name: Synthetic and emulator tests (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: linux
+          - runner: windows-2025
+            system: windows
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.6'
+      - name: Install exact hashed check dependencies
+        run: |
+          python -m pip --isolated install --only-binary=:all: --require-hashes --index-url https://pypi.org/simple -r requirements/ci.lock
+      - name: Static syntax, workflow, lock and dependency checks
+        run: |
+          python -m scripts.ci_checks static
+          python -m ruff check --no-cache scripts tests/test_release_pipeline.py --select E9,F63,F7,F82 --target-version py314
+          python -m pip check
+          python -m scripts.ci_checks secrets
+      - name: Fail on known dependency advisories or unavailable collection
+        run: |
+          mkdir -p evidence
+          python -m pip_audit --strict --disable-pip --require-hashes --timeout 15 --progress-spinner off --format json --output evidence/dependency-audit.json -r requirements/ci.lock
+      - name: Offline synthetic suite
+        run: |
+          mkdir -p evidence
+          python scripts/offline_tests.py --basetemp="$RUNNER_TEMP/offline-tests" -o cache_dir="$RUNNER_TEMP/pytest-cache" --junitxml=evidence/offline.xml
+          python -m scripts.ci_checks junit --path evidence/offline.xml --suite offline --system '${{ matrix.system }}' > evidence/offline-evidence.json
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: corretto
+          java-version: '21.0.11'
+      - name: Actual Firestore SDK transactions on owned loopback emulator
+        run: python -m scripts.ci_checks emulator --jar "$RUNNER_TEMP/firestore-1.21.0.jar" --output evidence
+      - name: Keep evidence even after a failed check
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: evidence-${{ matrix.system }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Immutable Linux artifact (production blocked)
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # PRs check untrusted source without entering a release promotion path.
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.6'
+      - run: |
+          python -m pip --isolated install --only-binary=:all: --require-hashes --index-url https://pypi.org/simple -r requirements/ci.lock
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: evidence-linux-${{ github.sha }}-${{ github.run_attempt }}
+          path: evidence/
+      - name: Build and validate exact artifact plus evidence hashes
+        run: python -m scripts.ci_artifact --root . --evidence evidence --output "$RUNNER_TEMP/release" --revision "$GITHUB_SHA"
+      - name: Install extracted wheels into a fresh runtime without package network
+        run: |
+          python -m venv "$RUNNER_TEMP/artifact-runtime"
+          python -m pip --isolated --python "$RUNNER_TEMP/artifact-runtime/bin/python" install --no-index --only-binary=:all: --require-hashes --find-links "$RUNNER_TEMP/release/extracted/wheelhouse" -r "$RUNNER_TEMP/release/extracted/requirements/runtime.lock"
+          "$RUNNER_TEMP/artifact-runtime/bin/python" -m pip check
+          "$RUNNER_TEMP/artifact-runtime/bin/python" scripts/artifact_smoke.py "$RUNNER_TEMP/release/extracted"
+      - name: Upload candidate artifact; no deployment job is enabled
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: blocked-release-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/release/release.tar.gz
+            ${{ runner.temp }}/release/release.sha256
+            ${{ runner.temp }}/release/provenance.json
+          if-no-files-found: error
+          retention-days: 7

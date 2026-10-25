@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "recovery_protocol": 1,
+  "production_release_supported": false,
+  "unresolved_gates": [
+    "linux_descendant_and_whole_service_containment",
+    "current_frontend_contract_and_native_lifecycle_integration",
+    "validated_commercial_configuration_and_billing_reconciliation",
+    "readiness_and_worker_health_contract",
+    "isolated_real_auth_provider_workspace_billing_validation",
+    "reviewed_indexes_migrations_retention_backup_and_rollback",
+    "operator_approved_staging_and_production_adapters"
+  ]
+}

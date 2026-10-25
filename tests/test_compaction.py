@@ -17,8 +17,6 @@ class FakeAdapter:
         return {"input_tokens": 10, "output_tokens": 5}
 
 
-compaction_module.get_adapter = lambda provider: FakeAdapter()
-compaction_module.record_usage = lambda uid, entry, usage: None
 
 
 def test_needs_compaction_false_when_short():
@@ -37,19 +35,15 @@ def test_needs_compaction_true_when_long_and_over_threshold():
         compaction_module.COMPACTION_TOKEN_THRESHOLD = original
 
 
-def test_compact_keeps_first_and_last_n_and_replaces_middle():
+def test_compact_keeps_first_and_last_n_and_replaces_middle(monkeypatch):
+    monkeypatch.setattr(compaction_module, "get_adapter", lambda _: FakeAdapter())
+    monkeypatch.setattr(compaction_module, "metered_create", lambda uid, adapter, entry, **kw: adapter.create(model=entry.model, **kw))
     messages = [{"role": "user", "content": [{"type": "text", "text": f"msg{i}"}]} for i in range(20)]
     session = {"uid": "u1", "messages": list(messages)}
-    compact(session)
+    from app.billing.plans import ModelEntry
+    compact(session, ModelEntry("test", "model", None))
     result = session["messages"]
     assert result[0] == messages[0]
     assert result[-COMPACTION_KEEP_LAST_N:] == messages[-COMPACTION_KEEP_LAST_N:]
     assert "did some stuff" in result[1]["content"][0]["text"]
     assert len(result) == 2 + COMPACTION_KEEP_LAST_N
-
-
-if __name__ == "__main__":
-    test_needs_compaction_false_when_short()
-    test_needs_compaction_true_when_long_and_over_threshold()
-    test_compact_keeps_first_and_last_n_and_replaces_middle()
-    print("ok")

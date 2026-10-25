@@ -1,3 +1,4 @@
+from tool_unit_adapter import handler_receipt_adapter
 from app.agent.tools import run_tool, supported_specs
 from app.sandbox.manager import manager
 

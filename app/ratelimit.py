@@ -4,7 +4,7 @@ import redis
 from fastapi import Depends, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from app.api.errors import error_response
 
 from app.auth import get_uid
 from app.security_log import log_security_event
@@ -35,7 +35,7 @@ def check_rate_limit(bucket: str, identity: str) -> None:
         pipe.expire(redis_key, window_seconds, nx=True)
         count, _ = pipe.execute()
     except redis.RedisError as exc:
-        log_security_event("rate_limit_backend_unavailable", bucket=bucket, error=str(exc))
+        log_security_event("rate_limit_backend_unavailable", bucket=bucket, error_type=type(exc).__name__)
         return
     if count > limit:
         log_security_event("rate_limit_exceeded", bucket=bucket, identity=identity, count=count)
@@ -62,5 +62,5 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         try:
             check_rate_limit(bucket, identity)
         except HTTPException as exc:
-            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+            return error_response(exc.status_code, exc.detail, code="request/rate-limited")
         return await call_next(request)

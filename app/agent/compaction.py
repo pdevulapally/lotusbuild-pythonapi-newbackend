@@ -3,12 +3,10 @@ import os
 
 from app.agent.providers import get_adapter
 from app.billing.plans import ModelEntry
-from app.billing.usage import record_usage
+from app.billing.budgets import metered_create
 
-COMPACTION_TOKEN_THRESHOLD = int(os.environ.get("COMPACTION_TOKEN_THRESHOLD", "60000"))
+COMPACTION_TOKEN_THRESHOLD = int(os.environ.get("COMPACTION_TOKEN_THRESHOLD", "8000"))
 COMPACTION_KEEP_LAST_N = int(os.environ.get("COMPACTION_KEEP_LAST_N", "10"))
-COMPACTION_PROVIDER = os.environ.get("COMPACTION_PROVIDER", "anthropic")
-COMPACTION_MODEL = os.environ.get("COMPACTION_MODEL", "claude-haiku-5-5")
 
 _SUMMARY_SYSTEM_PROMPT = "Summarize the key facts, decisions, and progress below in under 200 words."
 
@@ -22,19 +20,20 @@ def needs_compaction(messages: list[dict]) -> bool:
     return len(messages) > COMPACTION_KEEP_LAST_N + 1 and estimate_tokens(messages) > COMPACTION_TOKEN_THRESHOLD
 
 
-def compact(session: dict) -> None:
+def compact(session: dict, choice: ModelEntry) -> None:
     """Replaces everything but the first (original task) message and the last
     COMPACTION_KEEP_LAST_N messages with one summarized text message.
 
-    Keeps session["messages"] within the model's context budget AND within
-    Firestore's ~1MiB per-document limit - an uncompacted long session can hit
-    the latter regardless of any model's context window.
+    Uses the turn's authorized model and the same atomic budget guard. This is
+    best-effort compaction, not a proof of provider context/document limits;
+    oversized retained messages still fail the per-call envelope cap.
     """
     messages = session["messages"]
     first = messages[0]
     tail = messages[-COMPACTION_KEEP_LAST_N:]
     middle = messages[1:-COMPACTION_KEEP_LAST_N]
-    summary = _summarize(middle, session["uid"])
+    summary = _summarize(middle, session["uid"], choice)
+    session["_context_compacted"] = True
     session["messages"] = [
         first,
         {"role": "user", "content": [{"type": "text", "text": f"[earlier conversation summarized]\n{summary}"}]},
@@ -42,10 +41,9 @@ def compact(session: dict) -> None:
     ]
 
 
-def _summarize(middle: list[dict], uid: str) -> str:
-    adapter = get_adapter(COMPACTION_PROVIDER)
-    response = adapter.create(
-        model=COMPACTION_MODEL, system=_SUMMARY_SYSTEM_PROMPT, messages=middle, tools=[], max_tokens=512
+def _summarize(middle: list[dict], uid: str, choice: ModelEntry) -> str:
+    adapter = get_adapter(choice.provider)
+    response = metered_create(
+        uid, adapter, choice, system=_SUMMARY_SYSTEM_PROMPT, messages=middle, tools=[], max_tokens=512
     )
-    record_usage(uid, ModelEntry(COMPACTION_PROVIDER, COMPACTION_MODEL, quota=None), adapter.usage(response))
     return adapter.text(response)

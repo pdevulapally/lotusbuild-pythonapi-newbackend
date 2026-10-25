@@ -144,8 +144,10 @@ def test_any_risky_call_pauses_the_whole_batch_and_dispatches_nothing(monkeypatc
 
     monkeypatch.setattr(loop_module.manager, "get", lambda session_id: object())
     monkeypatch.setattr(loop_module, "checkpoint", lambda: None)
+    monkeypatch.setattr(loop_module, "prepare_actions", lambda session, step, calls:
+                        {"batch_id": "unit-batch", "action_ids": ["unit-one", "unit-two"]})
     monkeypatch.setattr(loop_module, "save_session", lambda session: None)
-    monkeypatch.setattr(loop_module, "record_usage", lambda uid, choice, usage: None)
+    monkeypatch.setattr(loop_module, "metered_create", lambda uid, adapter, choice, **kw: adapter.create(model=choice.model, **kw))
     monkeypatch.setattr(loop_module, "needs_compaction", lambda messages: False)
     monkeypatch.setattr(loop_module, "record_step", lambda *a, **kw: None)
     monkeypatch.setattr(loop_module, "dispatch_tool_call", lambda session, sandbox, name, input: dispatched.append(name))

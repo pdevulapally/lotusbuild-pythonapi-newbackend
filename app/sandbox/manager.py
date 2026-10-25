@@ -14,9 +14,12 @@ REGISTRY_COLLECTION = "agent_v2_sandbox_registry"
 
 def _kind_config(kind: str) -> dict:
     prefix = f"E2B_{kind.upper()}_"
+    timeout = int(os.environ.get(prefix + "TIMEOUT", "300"))
+    if not 1 <= timeout <= 900:
+        raise ValueError("sandbox lifetime must be between 1 and 900 seconds")
     return {
         "template": os.environ.get(prefix + "TEMPLATE") or None,
-        "timeout": int(os.environ.get(prefix + "TIMEOUT", "300")),
+        "timeout": timeout,
     }
 
 
@@ -31,7 +34,7 @@ class SandboxManager:
         if kind not in _BACKENDS:
             raise ValueError(f"unknown sandbox kind: {kind!r}, expected one of {sorted(_BACKENDS)}")
         config = _kind_config(kind)
-        kwargs = {"timeout": config["timeout"]}
+        kwargs = {"timeout": config["timeout"], "request_timeout": 30.0, "retries": 0}
         if config["template"]:
             kwargs["template"] = config["template"]
         sandbox = _BACKENDS[kind].create(**kwargs)
@@ -47,7 +50,7 @@ class SandboxManager:
         data = doc.to_dict()
         kind = data["kind"]
         try:
-            return _BACKENDS[kind].connect(data["sandbox_id"], timeout=_kind_config(kind)["timeout"])
+            return _BACKENDS[kind].connect(data["sandbox_id"], timeout=_kind_config(kind)["timeout"], request_timeout=30.0, retries=0)
         except Exception as exc:
             raise ValueError(
                 f"sandbox for session {session_id} is no longer available - start a new session"

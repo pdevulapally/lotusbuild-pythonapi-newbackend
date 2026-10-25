@@ -1,23 +1,42 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
-class SessionCreate(BaseModel):
+class SelectionInput(BaseModel):
+    @field_validator("model", "effort", "mode", mode="before", check_fields=False)
+    @classmethod
+    def explicit_selection_is_text(cls, value):
+        if type(value) is not str:
+            raise ValueError("selection must be a string")
+        return value
+
+
+class SessionCreate(SelectionInput):
     model_config = ConfigDict(extra="forbid")
     task: str = Field(min_length=1, max_length=32000)
-    kind: Literal["code", "desktop"] = "code"  # which E2B sandbox backend to run in: "code" or "desktop"
+    project_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
+    kind: Literal["code", "desktop"] = "code"
+    model: str | None = Field(default=None, min_length=1, max_length=128)
+    effort: Literal["low", "standard", "high", "xhigh"] | None = None
+    mode: Literal["build", "plan"] = "build"
 
 
-class MessageIn(BaseModel):
+class MessageIn(SelectionInput):
     model_config = ConfigDict(extra="forbid")
     content: str = Field(min_length=1, max_length=32000)
+    mode: Literal["build", "plan"] | None = None
 
 
 class SessionOut(BaseModel):
     id: str
     kind: str
+    model: str | None = None
+    effort: str | None = None
+    mode: str = "build"
     status: str
+    project_id: str | None = None
+    message_count: int | None = None
     schema_version: int = 2
     revision: int = 0
     created_at: str | None = None
@@ -25,6 +44,7 @@ class SessionOut(BaseModel):
     active_run_id: str | None = None
     cancel_requested: bool = False
     recovery_required: bool = False
+    recovery: dict | None = None
     error: str | None = None
     messages: list[dict]
     plan: list[dict] | None = None

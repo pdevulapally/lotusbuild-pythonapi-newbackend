@@ -1,16 +1,22 @@
 import os
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 
 from app.api.routes import router
+from app.api.contracts import router as contracts_router
+from app.api.queue import router as queue_router
+from app.api.task_authorization import router as task_authorization_router
+from app.api.errors import error_response
 from app.billing.routes import router as billing_router
 from app.github.routes import router as github_router
 from app.idempotency import IdempotencyConflict
 from app.execution.repository import CommandError
+from app.execution.errors import OutputLimitExceeded
 from app.ratelimit import RateLimitMiddleware
 from app.security_log import log_security_event
 
@@ -53,32 +59,63 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Authorization", "Idempotency-Key", "Content-Type"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Idempotency-Key", "Content-Type", "Last-Event-ID"],
     allow_credentials=False,
 )
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RateLimitMiddleware)
 
 app.include_router(router)
+app.include_router(contracts_router)
+app.include_router(queue_router)
+app.include_router(task_authorization_router)
 app.include_router(billing_router)
 app.include_router(github_router)
 
 
 @app.exception_handler(IdempotencyConflict)
 async def idempotency_conflict_handler(request: Request, exc: IdempotencyConflict):
-    return JSONResponse({"detail": str(exc)}, status_code=409)
+    return error_response(409, str(exc), code="command/conflict")
+
+
+from app.billing.model_select import SelectionError
+
+
+@app.exception_handler(SelectionError)
+async def selection_error_handler(request: Request, exc: SelectionError):
+    return error_response(exc.status, str(exc), code=exc.code)
 
 
 @app.exception_handler(CommandError)
 async def command_error_handler(request: Request, exc: CommandError):
-    return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+    return error_response(exc.status, str(exc), code=exc.code)
+
+
+@app.exception_handler(HTTPException)
+async def http_error_handler(request: Request, exc: HTTPException):
+    return error_response(exc.status_code, exc.detail, code=getattr(exc, "code", "request/rejected"),
+                          headers=exc.headers)
+
+
+@app.exception_handler(OutputLimitExceeded)
+async def payload_limit_handler(request: Request, exc: OutputLimitExceeded):
+    return error_response(413, "execution payload exceeds the configured limit", code="request/payload-too-large")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    # Validation contexts can contain exception objects; retain the native
+    # serializable location/type/message fields, never raw submitted input.
+    details = [{key: error[key] for key in ("loc", "type", "msg")} for error in exc.errors()]
+    return error_response(422, details, code="request/invalid")
 
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    log_security_event("unhandled_exception", path=request.url.path, error=str(exc))
-    return JSONResponse({"detail": "internal server error"}, status_code=500)
+    # Exception text and raw URL paths can contain customer data or credentials.
+    log_security_event("unhandled_exception", error_type=type(exc).__name__)
+    return error_response(500, "internal server error", code="server/internal")
 
 
 @app.get("/health")

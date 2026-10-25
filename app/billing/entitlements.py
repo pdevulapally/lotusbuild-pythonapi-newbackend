@@ -35,14 +35,19 @@ class Entitlements:
     tier_id: str
     limits: dict
     models: list[ModelEntry]
+    capabilities: list | None = None
+    meter_limits: list | None = None
 
 
-def resolve_entitlements(uid: str) -> Entitlements:
-    sub = db.collection("subscriptions").document(uid).get()
-    tier_id = _eligible_tier(sub.to_dict() or {}, time.time()) if sub.exists else DEFAULT_TIER
-    plan = get_plan(tier_id)
-    return Entitlements(
-        tier_id=tier_id,
-        limits=plan["limits"],
-        models=[ModelEntry(**m) for m in plan["models"]],
-    )
+def resolve_entitlements(uid: str, *, client=None, transaction=None, now=None) -> Entitlements:
+    ref = (db if client is None else client).collection("subscriptions").document(uid)
+    sub = ref.get() if transaction is None else ref.get(transaction=transaction)
+    tier_id = _eligible_tier(sub.to_dict() or {}, time.time() if now is None else now) if sub.exists else DEFAULT_TIER
+    try:
+        plan = get_plan(tier_id) if client is None and transaction is None else get_plan(
+            tier_id, client=client, transaction=transaction)
+        return Entitlements(tier_id=tier_id, limits=plan["limits"],
+                            models=[ModelEntry(**m) for m in plan["models"]], capabilities=plan.get("entitlements"), meter_limits=plan.get("meterLimits"))
+    except (ValueError, TypeError, KeyError):
+        from app.billing.model_select import SelectionError
+        raise SelectionError(503, "session/model-unavailable", "Model entitlement configuration is unavailable.") from None

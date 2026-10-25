@@ -11,7 +11,7 @@ class OpenAIAdapter(ProviderAdapter):
     supports_web_search = False
 
     def __init__(self, base_url: str | None = None, api_key: str | None = None):
-        kwargs = {}
+        kwargs = {"timeout": 60.0, "max_retries": 0}
         if base_url:
             kwargs["base_url"] = base_url
         if api_key:

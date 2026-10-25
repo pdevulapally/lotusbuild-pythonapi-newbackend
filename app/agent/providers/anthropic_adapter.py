@@ -19,7 +19,7 @@ class AnthropicAdapter(ProviderAdapter):
     supports_web_search = True
 
     def __init__(self):
-        self._client = anthropic.Anthropic()
+        self._client = anthropic.Anthropic(timeout=60.0, max_retries=0)
 
     def tool_schemas(self, specs: list[ToolSpec], include_web_search: bool = False) -> list[dict]:
         schemas = [{"name": s.name, "description": s.description, "input_schema": s.schema} for s in specs]
@@ -87,4 +87,11 @@ class AnthropicAdapter(ProviderAdapter):
         return [{"role": "tool_result", "content": content}]
 
     def usage(self, response) -> dict:
-        return {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        # Anthropic reports cached input separately. It still consumes the
+        # token allowance even when its monetary price differs.
+        inputs = [response.usage.input_tokens,
+                  getattr(response.usage, "cache_creation_input_tokens", None) or 0,
+                  getattr(response.usage, "cache_read_input_tokens", None) or 0]
+        if any(type(value) is not int or value < 0 for value in inputs):
+            raise ValueError("invalid provider usage")
+        return {"input_tokens": sum(inputs), "output_tokens": response.usage.output_tokens}

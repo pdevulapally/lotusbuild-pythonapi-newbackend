@@ -1,8 +1,6 @@
 import asyncio
-import os
 
-from fastapi import APIRouter, Depends, HTTPException, Response
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 
 from app.agent.memory import clear_memory, get_memory
 from app.agent.tracing import get_trace
@@ -21,10 +19,17 @@ from app.models import (
 from app.ratelimit import rate_limit_dependency
 from app.sandbox.manager import manager
 from app.store import get_session
+from app.api.events import router as events_router
+from app.api.actions import router as actions_router
+from app.api.streaming import AuthorizationGate, ManagedEventResponse, admission, POLL_SECONDS, read
+from app.auth import AuthenticationError
+from app.execution.limits import bounded_session
+from app.execution.errors import OutputLimitExceeded
 
 router = APIRouter()
+router.include_router(events_router)
+router.include_router(actions_router)
 
-SSE_POLL_INTERVAL_SECONDS = float(os.environ.get("SSE_POLL_INTERVAL_SECONDS", "1"))
 _TERMINAL_STATUSES = {"idle", "error", "cancelled", "awaiting_approval"}
 
 
@@ -45,11 +50,19 @@ def _require_live_session(session_id: str, uid: str) -> dict:
 @router.post("/sessions", response_model=SessionOut)
 def start_session(
     body: SessionCreate,
+    authorization: str | None = Header(default=None),
     uid: str = Depends(get_uid),
     idempotency_key: str = Depends(require_idempotency_key),
     _rl: None = Depends(rate_limit_dependency("mutate")),
 ):
-    return runs.submit(uid, idempotency_key, "create", body.model_dump())
+    # Retain the historical kind default in command fingerprints so an exact
+    # HTTP retry can replay a pre-selection receipt after an upgrade.
+    if body.project_id is not None:
+        from app.auth import get_verified_uid
+        if get_verified_uid(authorization) != uid:
+            raise HTTPException(status_code=401, detail="invalid token")
+    payload = {**body.model_dump(exclude_unset=True), "kind": body.kind}
+    return runs.submit(uid, idempotency_key, "create", payload)
 
 
 @router.get("/sessions/{session_id}", response_model=SessionOut)
@@ -57,8 +70,34 @@ def read_session(session_id: str, uid: str = Depends(get_uid)):
     return _require_session(session_id, uid)
 
 
+async def snapshot_stream(request, session_id, uid, authorization):
+    gate = AuthorizationGate(authorization, uid, lambda: _require_session(session_id, uid))
+    last_seen = None
+    try:
+        while not await request.is_disconnected():
+            session = await read(_require_session, session_id, uid)
+            bounded_session(session)
+            payload = SessionOut(**session).model_dump_json()
+            # Compare the actual public snapshot; timestamps/counts alone can
+            # miss same-tick cancellation or approval transitions.
+            await gate.ensure()
+            if payload != last_seen:
+                yield f"data: {payload}\n\n"
+                last_seen = payload
+            if session["status"] in _TERMINAL_STATUSES:
+                return
+            await asyncio.sleep(POLL_SECONDS)
+    except AuthenticationError:
+        yield 'event: error\ndata: {"error":"session access no longer authorized"}\n\n'
+    except HTTPException:
+        yield 'event: error\ndata: {"error":"session not found"}\n\n'
+    except Exception:
+        yield 'event: error\ndata: {"error":"session stream unavailable"}\n\n'
+
+
 @router.get("/sessions/{session_id}/stream")
-async def stream_session(session_id: str, uid: str = Depends(get_uid)):
+async def stream_session(request: Request, session_id: str,
+                         authorization: str | None = Header(default=None), uid: str = Depends(get_uid)):
     """Step-level live updates via SSE - pushes the current SessionOut shape
     whenever it changes, closing once the session leaves a non-terminal status.
 
@@ -67,24 +106,9 @@ async def stream_session(session_id: str, uid: str = Depends(get_uid)):
     `new EventSource(url)`. Don't pass the token as a query param instead -
     that leaks bearer tokens into access logs.
     """
-    _require_session(session_id, uid)
-
-    async def events():
-        last_seen = None
-        while True:
-            session = await asyncio.to_thread(get_session, session_id)
-            if session is None or session["uid"] != uid:
-                yield 'event: error\ndata: {"error":"session not found"}\n\n'
-                return
-            marker = (session["updated_at"], len(session["messages"]))
-            if marker != last_seen:
-                last_seen = marker
-                yield f"data: {SessionOut(**session).model_dump_json()}\n\n"
-            if session["status"] in _TERMINAL_STATUSES:
-                return
-            await asyncio.sleep(SSE_POLL_INTERVAL_SECONDS)
-
-    return StreamingResponse(events(), media_type="text/event-stream")
+    initial = await read(_require_session, session_id, uid)
+    bounded_session(initial)
+    return ManagedEventResponse(snapshot_stream(request, session_id, uid, authorization), admission.acquire(uid))
 
 
 @router.post("/sessions/{session_id}/messages", response_model=SessionOut)
@@ -95,7 +119,7 @@ def send_message(
     idempotency_key: str = Depends(require_idempotency_key),
     _rl: None = Depends(rate_limit_dependency("mutate")),
 ):
-    return runs.submit(uid, idempotency_key, "message", body.model_dump(), session_id)
+    return runs.submit(uid, idempotency_key, "message", body.model_dump(exclude_unset=True), session_id)
 
 
 @router.post("/sessions/{session_id}/approve", response_model=SessionOut)

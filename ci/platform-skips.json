@@ -1,0 +1,13 @@
+{
+  "linux": [
+    "tests.test_process_supervision::test_abrupt_parent_kill_stops_its_owned_child",
+    "tests.test_process_supervision::test_descendants_are_stopped_before_terminal_publication[False]",
+    "tests.test_process_supervision::test_descendants_are_stopped_before_terminal_publication[True]",
+    "tests.test_process_supervision::test_first_containment_failure_latches_stop_even_if_retry_succeeds[False]",
+    "tests.test_process_supervision::test_first_containment_failure_latches_stop_even_if_retry_succeeds[True]",
+    "tests.test_workspace_checkpoints::test_actual_windows_junction_escape_rejected",
+    "tests.test_release_pipeline::test_extraction_rejects_actual_windows_junction_target_and_ancestor",
+    "tests.integration.test_firestore_execution::test_actual_worker_parent_kill_recovers_real_state_without_replay_or_refund"
+  ],
+  "windows": []
+}

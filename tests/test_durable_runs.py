@@ -9,10 +9,42 @@ from app.execution.context import checkpoint, save
 from app.execution.repository import (
     CancelRequested, CommandError, JOBS_COLLECTION, LEASE_SECONDS, LeaseLost,
     CLEANUP_COLLECTION, CANCEL_GRACE_SECONDS, MAX_RUN_SECONDS,
-    RECEIPTS_COLLECTION, RunRepository,
+    RECEIPTS_COLLECTION, EVENTS_COLLECTION, RunRepository,
 )
 from app.store import SESSIONS_COLLECTION
-from app.worker import process_claim
+from app.execution.contracts import MESSAGES_COLLECTION
+from app.execution.slots import SLOTS_COLLECTION
+from app.worker import process_claim as worker_process_claim
+from app.execution.context import Guard, execution_context
+
+
+def inline_execution(repository, claim, handler, *, heartbeat_interval=10, **kwargs):
+    """Unit-test adapter for closures/fake SDKs; production always uses spawn."""
+    stopped, guard = threading.Event(), Guard(repository, claim)
+
+    def heartbeat():
+        while not stopped.wait(heartbeat_interval):
+            try:
+                repository.heartbeat(claim)
+            except Exception:
+                guard.lost = True
+                return
+
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        job, session = repository.start(claim)
+        with execution_context(guard):
+            handler(job, session)
+            guard.checkpoint()
+        repository.finish(claim)
+    finally:
+        stopped.set()
+        thread.join(heartbeat_interval + 1)
+
+
+def process_claim(*args, **kwargs):
+    return worker_process_claim(*args, execution=inline_execution, **kwargs)
 
 
 class Snapshot:
@@ -29,6 +61,8 @@ class Reference:
         self.db, self.collection, self.id = db, collection, key
 
     def get(self, transaction=None):
+        if transaction is not None and transaction.writes:
+            raise AssertionError("Firestore transactions require all reads before writes")
         return Snapshot(self.id, self.db.data.get((self.collection, self.id)))
 
 
@@ -47,12 +81,14 @@ class Query:
     def __init__(self, db, name, filters):
         self.db, self.name, self.filters = db, name, filters
         self.maximum = 100
+        self.sort_field = None
 
     def where(self, *, filter):
         self.filters.append(filter)
         return self
 
     def order_by(self, field):
+        self.sort_field = field
         return self
 
     def limit(self, n):
@@ -67,11 +103,16 @@ class Query:
                     return False
                 if f.op_string == "<=" and (value is None or value > f.value):
                     return False
+                if f.op_string == ">" and (value is None or value <= f.value):
+                    return False
                 if f.op_string == "in" and value not in f.value:
                     return False
             return True
-        return [Snapshot(k, v) for (c, k), v in list(self.db.data.items())
-                if c == self.name and matches(v)][:self.maximum]
+        records = [Snapshot(k, v) for (c, k), v in list(self.db.data.items())
+                   if c == self.name and matches(v)]
+        if self.sort_field:
+            records.sort(key=lambda item: item.data[self.sort_field])
+        return records[:self.maximum]
 
 
 class Transaction:
@@ -80,6 +121,12 @@ class Transaction:
 
     def set(self, ref, data):
         self.writes[(ref.collection, ref.id)] = copy.deepcopy(data)
+
+    def create(self, ref, data):
+        key = (ref.collection, ref.id)
+        if key in self.db.data or key in self.writes:
+            raise ValueError("document already exists")
+        self.set(ref, data)
 
 
 class MemoryDB:
@@ -122,12 +169,41 @@ def idle(repo, session):
     repo.finish(claim)
 
 
+def seal_pending(repo, claim, current, pending):
+    # Historical unit fixtures still need an actual selected model/entitlement
+    # now that parent approval permissions revalidate it before effects.
+    pending.setdefault("provider", "test-provider")
+    pending.setdefault("model", "test-model")
+    pending.setdefault("quota", None)
+    from app.billing.entitlements import resolve_entitlements
+    from app.billing.model_select import SelectionError
+    try:
+        resolve_entitlements(current["uid"], client=repo.db, now=repo.clock())
+    except SelectionError:
+        tier = "fixture-approval-" + current["uid"]
+        subscription = {"tier_id": tier, "status": "active", "current_period_end": repo.clock() + 3600}
+        plan = {"limits": {"requests_per_day": 100, "tokens_per_month": 1_000_000},
+                "models": [{"provider": pending["provider"], "model": pending["model"], "quota": None}]}
+        if isinstance(repo.db, MemoryDB):
+            repo.db.data[("subscriptions", current["uid"])] = subscription
+            repo.db.data[("plans", tier)] = plan
+        else:
+            repo.db.collection("subscriptions").document(current["uid"]).set(subscription)
+            repo.db.collection("plans").document(tier).set(plan)
+    calls = [{k: c[k] for k in ("id", "name", "input")} for c in pending["calls"]]
+    batch = repo.prepare_actions(claim, step=0, calls=calls)
+    current.update(batch["session"])
+    pending["batch_id"] = batch["batch_id"]
+    for call, action_id in zip(pending["calls"], batch["action_ids"]):
+        call["action_id"] = action_id
+    current.update(status="awaiting_approval", pending_approval=pending)
+
+
 def waiting(repo, session):
     claim = repo.claim(session["active_run_id"], "worker")
     _, current = repo.start(claim)
-    current["status"] = "awaiting_approval"
-    current["pending_approval"] = {"id": "batch-1", "calls": [
-        {"id": "call-1", "name": "bash", "input": {"command": "echo hi"}, "risky": True}]}
+    seal_pending(repo, claim, current, {"id": "batch-1", "calls": [
+        {"id": "call-1", "name": "bash", "input": {"command": "sudo synthetic"}, "risky": True}]})
     repo.save(claim, current)
     repo.finish(claim)
     return current
@@ -138,11 +214,11 @@ def test_submission_commits_session_job_and_receipt_together(env):
     session = create(repo)
     assert session["status"] == "queued"
     assert session["schema_version"] == 2
-    assert {c for c, _ in db.data} == {SESSIONS_COLLECTION, JOBS_COLLECTION, RECEIPTS_COLLECTION}
+    assert {c for c, _ in db.data} == {SESSIONS_COLLECTION, JOBS_COLLECTION, RECEIPTS_COLLECTION, SLOTS_COLLECTION, EVENTS_COLLECTION, MESSAGES_COLLECTION}
     # Worker discovers queued record even if API dies immediately after commit.
     assert repo.claim(session["active_run_id"], "restarted-worker")
     assert create(repo) == session  # replay does not lose/schedule another job
-    assert len(db.data) == 3
+    assert len(db.data) == 6
 
 
 def test_changed_idempotency_payload_rejected(env):
@@ -286,6 +362,7 @@ def test_fake_worker_complete_and_new_turn(env):
     def fake_handler(job, state):
         checkpoint()
         state["messages"].append({"role": "assistant", "content": [{"type": "text", "text": "done"}]})
+        state["_transcript_append"] = state["messages"][-1:]
         state["status"] = "idle"
         save(state)
     process_claim(repo, claim, fake_handler)
@@ -405,6 +482,7 @@ def test_real_agent_loop_observes_cancel_after_model(env, monkeypatch):
             return object()
         def usage(self, response):
             pytest.fail("model response must not dispatch work after cancellation")
+    monkeypatch.setattr(loop, "metered_create", lambda uid, adapter, entry, **kw: adapter.create(model=entry.model, **kw))
     def handler(job, state):
         state["system_prompt"] = "test"
         loop._agent_loop(state, Adapter(), ModelEntry("test", "model", None), [])
